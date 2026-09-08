@@ -156,6 +156,13 @@ impl MemoryPool for SlicedPool {
         failures: &mut ErrorGraph,
     ) -> Option<super::ManagedMemoryHandle> {
         for (page, _) in self.pages.iter_mut() {
+            // A reservation takes the first free slice that fits, and most of them find one on
+            // the page as it is. Merging the free neighbours costs a walk over every slice of
+            // the page, so it is only done when a fit has to be assembled from them.
+            if let Some(handle) = page.try_reserve(size) {
+                self.largest_alloc = self.largest_alloc.max(size);
+                return Some(handle);
+            }
             page.coalesce(failures);
             if let Some(handle) = page.try_reserve(size) {
                 self.largest_alloc = self.largest_alloc.max(size);
