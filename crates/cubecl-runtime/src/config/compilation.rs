@@ -1,13 +1,18 @@
 use super::logger::{LogLevel, LoggerConfig};
 
 /// Configuration for compilation settings in `CubeCL`.
-#[derive(Default, Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct CompilationConfig {
     /// Logger configuration for compilation logs, using binary log levels.
     #[serde(default)]
     pub logger: LoggerConfig<CompilationLogLevel>,
     /// Whether compiled kernels are cached in the active environment.
-    #[serde(default)]
+    ///
+    /// Enabled by default: compiling the kernels of a program takes seconds to tens of seconds
+    /// every time a process starts, and a cached artifact is only reused by the very build that
+    /// produced it, for the very device it was compiled for. Disable it to compile everything
+    /// again on every run, for instance when working on a compiler.
+    #[serde(default = "default_cache")]
     #[cfg(persistence)]
     pub cache: bool,
     /// Controls whether kernel launches enforce bounds checks.
@@ -59,6 +64,23 @@ impl core::fmt::Display for F16Evaluation {
     }
 }
 
+impl Default for CompilationConfig {
+    fn default() -> Self {
+        Self {
+            logger: LoggerConfig::default(),
+            #[cfg(persistence)]
+            cache: default_cache(),
+            check_mode: BoundsCheckMode::default(),
+            f16_evaluation: None,
+        }
+    }
+}
+
+#[cfg(persistence)]
+fn default_cache() -> bool {
+    true
+}
+
 /// Bounds checks options.
 #[derive(Default, Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
 pub enum BoundsCheckMode {
@@ -93,3 +115,26 @@ pub enum CompilationLogLevel {
 }
 
 impl LogLevel for CompilationLogLevel {}
+
+#[cfg(all(test, persistence))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cache_is_enabled_by_default() {
+        assert!(CompilationConfig::default().cache);
+    }
+
+    #[test]
+    fn cache_omitted_in_toml_stays_enabled() {
+        // A `[compilation]` section written for another setting must not turn the cache off.
+        let config: CompilationConfig = toml::from_str("check_mode = \"validate\"").unwrap();
+        assert!(config.cache);
+    }
+
+    #[test]
+    fn cache_can_be_disabled_in_toml() {
+        let config: CompilationConfig = toml::from_str("cache = false").unwrap();
+        assert!(!config.cache);
+    }
+}

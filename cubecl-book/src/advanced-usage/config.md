@@ -97,6 +97,11 @@ The `[compilation]` section manages logging and caching for kernel compilation.
 - `basic`: Logs when kernels are compiled.
 - `full`: Logs full details, including source code.
 
+**Cache** (`cache`): whether the compiled kernels (PTX, SPIR-V, MSL, HIP code objects) are kept
+in the active environment, next to the autotune results, so that later runs of the same build skip
+the compiler. Enabled by default; a rebuilt binary or another device starts from scratch. Set it
+to `false` to compile every kernel on every run, for instance while working on a compiler.
+
 **f16 evaluation** (`f16_evaluation`, CPU runtime only): how far an f16 intermediate is carried in
 f32 before it is rounded back. Unset, it is `per-operation` on a host with f16 arithmetic of its
 own and `chain` elsewhere.
@@ -109,6 +114,7 @@ own and `chain` elsewhere.
 
 ```toml
 [compilation]
+cache = false
 logger = { level = "basic", file = "cubecl.log", append = true }
 f16_evaluation = "chain"
 ```
