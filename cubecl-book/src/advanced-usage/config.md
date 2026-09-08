@@ -97,10 +97,16 @@ The `[compilation]` section manages logging and caching for kernel compilation.
 - `basic`: Logs when kernels are compiled.
 - `full`: Logs full details, including source code.
 
+**Cache** (`cache`): whether the compiled kernels (PTX, SPIR-V, MSL, HIP code objects) are kept
+in the active environment, next to the autotune results, so that later runs of the same build skip
+the compiler. Enabled by default; a rebuilt binary or another device starts from scratch. Set it
+to `false` to compile every kernel on every run, for instance while working on a compiler.
+
 **Example:**
 
 ```toml
 [compilation]
+cache = false
 logger = { level = "basic", file = "cubecl.log", append = true }
 ```
 
