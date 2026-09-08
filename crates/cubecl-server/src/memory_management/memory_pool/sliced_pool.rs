@@ -145,6 +145,12 @@ impl SlicedPool {
             .iter_mut()
             .filter(|(page, _)| !page.is_guarded())
             .find_map(|(page, _)| {
+                // A reservation takes the first free slice that fits, and most of them find one
+                // on the page as it is. Merging the free neighbours costs a walk over every slice
+                // of the page, so it is only done when a fit has to be assembled from them.
+                if let Some(handle) = page.try_reserve(size) {
+                    return Some(handle);
+                }
                 page.coalesce(failures);
                 page.try_reserve(size)
             });
