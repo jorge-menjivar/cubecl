@@ -815,10 +815,53 @@ mod custom_channel {
     };
     use core::{
         hint::spin_loop,
-        sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, Ordering},
+        sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, Ordering},
         time::Duration,
     };
-    use std::{sync::Arc, vec::Vec};
+    use std::{sync::Arc, time::Instant, vec::Vec};
+
+    /// STUDY: counters reported every 4096 batches when `CUBECL_CHANNEL_STATS` is set.
+    struct Stats {
+        started: Instant,
+        enqueued: AtomicU64,
+        blocked_ns: AtomicU64,
+        blocked_events: AtomicU64,
+        fetches: AtomicU64,
+        partial: AtomicU64,
+        exec_ns: AtomicU64,
+        idle_ns: AtomicU64,
+    }
+
+    impl Stats {
+        fn new() -> Self {
+            Self {
+                started: Instant::now(),
+                enqueued: AtomicU64::new(0),
+                blocked_ns: AtomicU64::new(0),
+                blocked_events: AtomicU64::new(0),
+                fetches: AtomicU64::new(0),
+                partial: AtomicU64::new(0),
+                exec_ns: AtomicU64::new(0),
+                idle_ns: AtomicU64::new(0),
+            }
+        }
+
+        fn report(&self, runner_id: &RunnerId) {
+            let ms = |v: &AtomicU64| v.load(Ordering::Relaxed) as f64 / 1e6;
+            std::eprintln!(
+                "[channel {:?}] wall {:.0} ms, batches {} (partial {}), tasks {}, exec {:.0} ms, idle {:.0} ms, client blocked {:.0} ms in {} waits",
+                runner_id.stage,
+                self.started.elapsed().as_secs_f64() * 1e3,
+                self.fetches.load(Ordering::Relaxed),
+                self.partial.load(Ordering::Relaxed),
+                self.enqueued.load(Ordering::Relaxed),
+                ms(&self.exec_ns),
+                ms(&self.idle_ns),
+                ms(&self.blocked_ns),
+                self.blocked_events.load(Ordering::Relaxed),
+            );
+        }
+    }
 
     /// Maximum number of [`Task`] that can be queued.
     pub const CHANNEL_MAX_TASK: usize = 32;
@@ -832,6 +875,14 @@ mod custom_channel {
     /// Sleep duration once both the spin and yield budgets are exhausted.
     /// Bounds the wake-up latency from a fully idle state.
     const SLEEP_STEP_SERVER: Duration = Duration::from_micros(150);
+    /// Number of `spin_loop` iterations without a full buffer after which the server takes the
+    /// tasks queued so far rather than waiting for the buffer to fill.
+    ///
+    /// A producer that is slower than the server never fills the buffer quickly: waiting for it
+    /// leaves the server idle while whatever is downstream of it starves, and the producer stalls
+    /// as soon as it is one buffer ahead. Taking the partial batch turns the exchange into a
+    /// stream under light load, while a producer that keeps up still hands over full buffers.
+    const PARTIAL_BATCH_SPIN_BUDGET: u32 = 2048;
 
     /// The client has the buffer to fill plus we add a factor of two to account for the double
     /// buffering approach.
@@ -903,9 +954,13 @@ mod custom_channel {
         /// Atomically reserves a slot in the buffer and writes the task.
         pub fn enqueue<F: FnOnce() + Send + 'static>(&self, func: F) -> Result<(), CallError> {
             let mut idle_count: u32 = 0;
+            let mut blocked_since: Option<Instant> = None;
             loop {
                 let index = self.state.available_index.fetch_add(1, Ordering::Acquire) as usize;
                 if index >= CHANNEL_MAX_TASK {
+                    if self.state.stats.is_some() && blocked_since.is_none() {
+                        blocked_since = Some(Instant::now());
+                    }
                     // The queue is full; back off until the server flushes/swaps buffers.
                     if idle_count < SPIN_BUDGET_CLIENT {
                         spin_loop();
@@ -918,6 +973,15 @@ mod custom_channel {
                     continue;
                 }
 
+                if let Some(stats) = &self.state.stats {
+                    stats.enqueued.fetch_add(1, Ordering::Relaxed);
+                    if let Some(since) = blocked_since {
+                        stats
+                            .blocked_ns
+                            .fetch_add(since.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                        stats.blocked_events.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
                 self.state.init_task_at(index, func);
                 self.state.enqueued_count.fetch_add(1, Ordering::SeqCst);
                 return Ok(());
@@ -945,6 +1009,8 @@ mod custom_channel {
         shutdown: AtomicBool,
         /// The runner id (for debugging purposes).
         runner_id: RunnerId,
+        /// STUDY: see [`Stats`].
+        stats: Option<Stats>,
     }
 
     impl State {
@@ -1037,6 +1103,7 @@ mod custom_channel {
                 enqueued_count: AtomicU32::new(0),
                 shutdown: AtomicBool::new(false),
                 runner_id,
+                stats: std::env::var_os("CUBECL_CHANNEL_STATS").map(|_| Stats::new()),
             });
 
             Self {
@@ -1050,17 +1117,46 @@ mod custom_channel {
         /// Main execution loop for the device thread.
         fn start(&mut self) {
             let mut idle_count: u32 = 0;
+            let mut exec_end: Option<Instant> = None;
             loop {
                 if self.ready_to_execute {
+                    let exec_start = self.state.stats.as_ref().map(|_| Instant::now());
                     self.execute_tasks();
+                    if let (Some(stats), Some(start)) = (&self.state.stats, exec_start) {
+                        let now = Instant::now();
+                        stats
+                            .exec_ns
+                            .fetch_add((now - start).as_nanos() as u64, Ordering::Relaxed);
+                        exec_end = Some(now);
+                    }
                     idle_count = 0;
                 }
 
                 let queue_size = self.state.enqueued_count.load(Ordering::Acquire) as usize;
 
                 if queue_size >= CHANNEL_MAX_TASK {
+                    if let Some(stats) = &self.state.stats {
+                        if let Some(end) = exec_end.take() {
+                            stats
+                                .idle_ns
+                                .fetch_add(end.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                        }
+                        if (stats.fetches.fetch_add(1, Ordering::Relaxed) + 1) % 4096 == 0 {
+                            stats.report(&self.state.runner_id);
+                        }
+                    }
                     self.fetch();
                     idle_count = 0;
+                    continue;
+                }
+
+                // Padding the buffer is how a flush completes it too, so the swap that follows
+                // sees a full buffer and waits for the writes still in flight like any other.
+                if queue_size > 0 && idle_count >= PARTIAL_BATCH_SPIN_BUDGET {
+                    if let Some(stats) = &self.state.stats {
+                        stats.partial.fetch_add(1, Ordering::Relaxed);
+                    }
+                    self.state.pad_with_noops();
                     continue;
                 }
 
