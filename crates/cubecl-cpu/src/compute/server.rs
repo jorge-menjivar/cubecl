@@ -255,10 +255,10 @@ impl Server for CpuServer {
         }
 
         let mut streams = vec![stream_id];
-        let mut results = Vec::with_capacity(descriptors.len());
-        let mut resources = Vec::with_capacity(descriptors.len());
+        let mut views = Vec::with_capacity(descriptors.len());
 
-        // Since we do a zero-copy read, we can collect bytes before synching the streams.
+        // Taking a view touches no memory, so the views can be taken before
+        // the streams that write the buffers have run.
         for desc in descriptors {
             if !streams.contains(&desc.handle.stream) {
                 streams.push(desc.handle.stream);
@@ -266,8 +266,7 @@ impl Server for CpuServer {
             // The resource lives in the memory management of the stream that
             // owns the handle, which is not always the reader's.
             let stream = self.scheduler.stream(&desc.handle.stream);
-            let result = stream.read_async(desc);
-            results.push(result);
+            views.push(stream.read_view(desc));
         }
 
         self.scheduler.execute_streams(streams);
@@ -278,16 +277,19 @@ impl Server for CpuServer {
             return Box::pin(async move { Err(err) });
         }
 
-        Box::pin(async move {
-            for result in results {
-                match result.await {
-                    Ok(val) => resources.push(val),
-                    Err(err) => return Err(err.into()),
-                }
-            }
+        // Copied out here, now that the work the read waits for has run, and
+        // on this thread, before any later command can. A read is a snapshot
+        // of the buffers as they are now; the views alias live allocations,
+        // and handing one out would let whatever writes the buffer next — the
+        // tensor's next use, fused and written in place into its own buffer,
+        // which the view's binding does not prevent — show through bytes the
+        // caller already holds.
+        let snapshots = views
+            .into_iter()
+            .map(|view| view.map(|view| snapshot(&view)).map_err(Into::into))
+            .collect::<Result<Vec<_>, ServerError>>();
 
-            Ok(resources)
-        })
+        Box::pin(async move { snapshots })
     }
 
     fn write(&mut self, descriptors: Vec<(CopyDescriptor, Bytes)>, stream_id: StreamId) {
@@ -505,6 +507,18 @@ impl Server for CpuServer {
 }
 
 impl ServerCommunication for CpuServer {}
+
+/// An owned copy of `view`, in one allocation aligned for any element type, which is what the
+/// other runtimes' reads hand back.
+///
+/// Started from `from_bytes_vec` because it aligns even an empty buffer, and an empty read is
+/// still reinterpreted as elements: a bare `Vec<u8>` would leave it with a byte-aligned pointer
+/// no `f32` slice can be cast from.
+fn snapshot(view: &Bytes) -> Bytes {
+    let mut owned = Bytes::from_bytes_vec(Vec::new());
+    owned.extend_from_byte_slice(view);
+    owned
+}
 
 pub(crate) fn contiguous_strides(shape: &Shape) -> Strides {
     let rank = shape.len();

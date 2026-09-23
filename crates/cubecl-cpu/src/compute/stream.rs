@@ -204,24 +204,21 @@ impl CpuStream {
             .unwrap();
     }
 
-    pub fn read_async(
-        &mut self,
-        descriptor: CopyDescriptor,
-    ) -> impl Future<Output = Result<Bytes, IoError>> + Send + use<> {
-        fn inner(
-            mem: &mut MemoryManagement<BytesStorage>,
-            descriptor: CopyDescriptor,
-        ) -> Result<Bytes, IoError> {
-            let len = descriptor.handle.size_in_used() as usize;
-            let controller = Box::new(CpuAllocController::init(descriptor.handle, mem)?);
-            // SAFETY:
-            // - The binding has initialized memory for at least `len` bytes.
-            Ok(unsafe { Bytes::from_controller(controller, len) })
-        }
-
-        let res = inner(&mut self.memory_management, descriptor);
-
-        async move { res }
+    /// A zero-copy view of the memory `descriptor` names, aliasing the live pool allocation.
+    ///
+    /// Taking it touches no memory, so it can be taken before the work that writes the
+    /// buffer has run. It is not a read: the allocation stays live, and whatever writes it
+    /// later shows through. The server copies it out once the streams have run, see
+    /// `CpuServer::read`.
+    pub fn read_view(&mut self, descriptor: CopyDescriptor) -> Result<Bytes, IoError> {
+        let len = descriptor.handle.size_in_used() as usize;
+        let controller = Box::new(CpuAllocController::init(
+            descriptor.handle,
+            &mut self.memory_management,
+        )?);
+        // SAFETY:
+        // - The binding has initialized memory for at least `len` bytes.
+        Ok(unsafe { Bytes::from_controller(controller, len) })
     }
 
     pub fn start_profile(&mut self, stream_id: StreamId) -> Result<ProfilingToken, ServerError> {
