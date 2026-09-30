@@ -133,8 +133,12 @@ impl ExclusiveMemoryPool {
         storage: &mut Storage,
         size: u64,
     ) -> Result<(usize, &mut MemoryPage), IoError> {
+        // A zero-sized allocation still gets a page of its own, and no driver
+        // hands out zero bytes: CUDA answers `cuMemAlloc(0)` with
+        // CUDA_ERROR_INVALID_VALUE. One aligned unit is the least it asks.
         let alloc_size = (self.cur_avg_size as u64)
             .max(size)
+            .max(1)
             .next_multiple_of(self.alignment);
 
         let storage = storage.alloc(alloc_size)?;
@@ -334,5 +338,67 @@ impl MemoryPool for ExclusiveMemoryPool {
             })?;
 
         Ok(&mut page.slice)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::storage::{StorageHandle, StorageId};
+
+    /// Device memory that refuses a zero-byte allocation, as CUDA's
+    /// `cuMemAlloc` does.
+    struct NoEmptyAllocations;
+
+    impl ComputeStorage for NoEmptyAllocations {
+        type Resource = ();
+
+        fn alignment(&self) -> usize {
+            32
+        }
+
+        fn get(&mut self, _handle: &StorageHandle) -> Result<(), IoError> {
+            Ok(())
+        }
+
+        fn alloc(&mut self, size: u64) -> Result<StorageHandle, IoError> {
+            if size == 0 {
+                return Err(IoError::Unknown {
+                    description: "a zero-byte allocation".into(),
+                    backtrace: BackTrace::capture(),
+                });
+            }
+            Ok(StorageHandle::new(
+                StorageId::new(),
+                StorageUtilization { offset: 0, size },
+            ))
+        }
+
+        fn dealloc(&mut self, _id: StorageId) {}
+
+        fn flush(&mut self) {}
+
+        fn bytes_allocated(&self) -> u64 {
+            0
+        }
+    }
+
+    /// An empty tensor still needs a handle: the pool that serves zero-sized
+    /// allocations asks the device for a page it can hand out.
+    #[test]
+    fn an_empty_allocation_asks_the_device_for_bytes() {
+        let mut pool = ExclusiveMemoryPool::new(ExclusiveLayout {
+            max_alloc_size: 0,
+            alignment: 32,
+            dealloc_period: u64::MAX,
+            pool: 0,
+        });
+        let handle = pool.reserve(
+            &mut NoEmptyAllocations,
+            0,
+            PageMapping::Eager,
+            &mut ErrorGraph::default(),
+        );
+        assert!(handle.is_ok(), "{:?}", handle.err());
     }
 }
