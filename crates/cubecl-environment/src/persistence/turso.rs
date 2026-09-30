@@ -27,6 +27,7 @@ use turso::transaction::TransactionBehavior;
 
 use super::{InsertSummary, Insertion, NamespaceSummary, Origin, Storage};
 use crate::bytes::Bytes;
+use crate::sync::reentrant::ReentrantMutex;
 use crate::sync::{LazyLock, Mutex};
 
 /// The database schema this build reads and writes. A file carrying any other
@@ -96,6 +97,21 @@ enum DatabaseState {
     Opening(Vec<async_channel::Sender<DatabaseResult>>),
     Ready(Arc<turso::Database>),
 }
+
+/// Held by every statement this process runs through the engine, whichever
+/// connection runs it, so no two run at once.
+///
+/// A read transaction registers in a reader table the engine keeps per
+/// database file and shares between processes. Its bookkeeping within one
+/// process is not safe against another thread's (`turso_core` 0.8.1):
+/// connections reading on several threads, as when a progress sampler counts
+/// entries while the device runner reads and writes kernels, now and then find
+/// their slot released by someone else and fail an assertion — "reader slot
+/// released by non-owner" — panicking in whatever read the cache. Taking turns
+/// costs nothing a cache notices; its statements are few and short.
+///
+/// Re-entrant, because a statement's caller may connect again before it is done.
+static ENGINE: LazyLock<ReentrantMutex<()>> = LazyLock::new(|| ReentrantMutex::new(()));
 
 /// The databases this process has opened, by location, so that every
 /// namespace of an environment shares one.
@@ -227,6 +243,7 @@ impl Database {
     /// (a bundle's manifest).
     #[cfg(native_cache)]
     pub(crate) fn with_connection<T>(&self, operation: impl FnOnce(&turso::Connection) -> T) -> T {
+        let _engine = ENGINE.lock();
         operation(&self.connection.lock())
     }
 
@@ -238,6 +255,7 @@ impl Database {
         namespace: &str,
         operation: impl FnOnce(&mut turso::Connection) -> Result<T, turso::Error>,
     ) -> Result<T, String> {
+        let _engine = ENGINE.lock();
         operation(&mut self.connection.lock()).map_err(|err| {
             log::warn!(
                 "Unable to {name} {}: {err}",
@@ -288,6 +306,7 @@ impl Database {
         entries: &mut dyn Iterator<Item = (Bytes, Bytes)>,
         origin: Origin,
     ) -> InsertSummary {
+        let _engine = ENGINE.lock();
         let mut connection = self.connection.lock();
         let transaction = match drive(connection.transaction_with_behavior(write_transaction())) {
             Ok(transaction) => transaction,
@@ -713,6 +732,7 @@ async fn open_read_only(location: &str) -> Result<turso::Database, String> {
         .build()
         .await
         .map_err(error)?;
+    let _engine = ENGINE.lock();
     let connection = connect(&database).map_err(error)?;
 
     let expected = SCHEMA_VERSION.to_string();
@@ -799,6 +819,7 @@ fn write_transaction() -> TransactionBehavior {
 /// once rebuild it once: the second waits, then reads the version the first
 /// wrote.
 pub(crate) fn migrate(database: &turso::Database) -> Result<(), turso::Error> {
+    let _engine = ENGINE.lock();
     let mut connection = connect(database)?;
     drive(connection.execute(CREATE_META, ()))?;
 
@@ -968,6 +989,7 @@ const BUSY_TIMEOUT: core::time::Duration = core::time::Duration::from_secs(5);
 /// backend made. It is set on read-only connections too, where it is a no-op,
 /// so that every connection this module hands out is configured alike.
 pub(crate) fn connect(database: &turso::Database) -> Result<turso::Connection, turso::Error> {
+    let _engine = ENGINE.lock();
     let connection = database.connect()?;
     connection.busy_timeout(BUSY_TIMEOUT)?;
     // A `PRAGMA` that assigns answers with no rows, which `execute` reports as
