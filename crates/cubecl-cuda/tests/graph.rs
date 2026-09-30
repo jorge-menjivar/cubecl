@@ -9,10 +9,8 @@ use cubecl_server::runtime::Runtime;
 use std::sync::Mutex;
 
 /// Graph capture holds the one cached client's stream for its whole window,
-/// and `CU_STREAM_CAPTURE_MODE_GLOBAL` makes any
-/// concurrent unsafe call (alloc, sync) in the process abort a recording
-/// capture — so two captures must not overlap: exactly one capture at a time
-/// per device, as in real use. Serialize the tests instead of relying on
+/// so two captures must not overlap: exactly one capture at a time per
+/// device, as in real use. Serialize the tests instead of relying on
 /// `--test-threads 1`.
 static CAPTURE_LOCK: Mutex<()> = Mutex::new(());
 
@@ -416,4 +414,48 @@ fn cuda_graph_capture_is_reported_to_its_clients() {
     let _graph = client.stop_capture().expect("stop_capture");
     assert!(!client.is_capturing(), "the capture ends with stop_capture");
     assert!(!other_client.is_capturing());
+}
+
+/// The device thread serves every stream, the capturing one's and the rest:
+/// while one stream records, another stream's read — which waits on an event
+/// — must still go through, and must not spoil the recording.
+#[test]
+fn cuda_graph_capture_lets_another_stream_read() {
+    let _guard = CAPTURE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let client = CudaRuntime::client(&Default::default());
+
+    let n = 4usize;
+    let input = client.create_from_slice(f32::as_bytes(&[1.0, 2.0, 3.0, 4.0]));
+    let output = client.empty(n * core::mem::size_of::<f32>());
+    let launch = |client: &Client| {
+        add_one::launch(
+            client,
+            CubeCount::Static(1, 1, 1),
+            CubeDim::new(client, n),
+            unsafe { BufferArg::from_raw_parts(input.clone(), n) },
+            unsafe { BufferArg::from_raw_parts(output.clone(), n) },
+        );
+    };
+
+    client.graph_prepare().expect("graph_prepare");
+    launch(&client);
+    let _ = client.read_one(output.clone()).unwrap();
+    client.start_capture().expect("start_capture");
+    launch(&client);
+
+    // Streams are per thread: this one is not the capturing stream.
+    let other = client.clone();
+    let read = std::thread::spawn(move || {
+        let data = other.create_from_slice(f32::as_bytes(&[5.0, 6.0]));
+        other.read_one(data).map(|bytes| f32::from_bytes(&bytes).to_vec())
+    })
+    .join()
+    .unwrap();
+    assert_eq!(read.expect("the other stream's read"), [5.0, 6.0]);
+
+    let graph = client.stop_capture().expect("stop_capture");
+    // Safety: every handle the graph uses is alive and nothing else writes them.
+    unsafe { graph.replay() }.expect("replay");
+    let actual = client.read_one(output.clone()).unwrap();
+    assert_eq!(f32::from_bytes(&actual), &[2.0, 3.0, 4.0, 5.0]);
 }
